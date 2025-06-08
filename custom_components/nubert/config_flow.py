@@ -8,11 +8,11 @@ from homeassistant.components.bluetooth import (  # type: ignore
     BluetoothServiceInfo,
 )
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.const import CONF_ADDRESS, ATTR_SUGGESTED_AREA, CONF_NAME
+from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.helpers import selector
 import voluptuous as vol
 
-from .const import DOMAIN, ADV_UUID
+from .const import DOMAIN, ADV_UUIDS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,10 +52,7 @@ class NubertConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             name = user_input.get(CONF_NAME) or title_default
-            area = user_input.get(ATTR_SUGGESTED_AREA)
             data = {CONF_ADDRESS: self._discovery_info.address}
-            if area:
-                data[ATTR_SUGGESTED_AREA] = area
             return self.async_create_entry(
                 title=name,
                 data=data,
@@ -65,7 +62,6 @@ class NubertConfigFlow(ConfigFlow, domain=DOMAIN):
         schema = vol.Schema(
             {
                 vol.Optional(CONF_NAME, default=title_default): str,
-                vol.Optional(ATTR_SUGGESTED_AREA): selector.AreaSelector(),
             }
         )
         return self.async_show_form(step_id="bluetooth_confirm", data_schema=schema)
@@ -78,12 +74,9 @@ class NubertConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             address = user_input[CONF_ADDRESS]
             name = user_input.get(CONF_NAME, address)
-            area = user_input.get(ATTR_SUGGESTED_AREA)
             await self.async_set_unique_id(address)
             self._abort_if_unique_id_configured()
             data = {CONF_ADDRESS: address}
-            if area:
-                data[ATTR_SUGGESTED_AREA] = area
             return self.async_create_entry(title=name, data=data)
 
         # Build dropdown of currently discovered devices
@@ -107,7 +100,6 @@ class NubertConfigFlow(ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(CONF_ADDRESS): address_selector,
                     vol.Optional(CONF_NAME): str,
-                    vol.Optional(ATTR_SUGGESTED_AREA): selector.AreaSelector(),
                 }
             )
         else:
@@ -115,7 +107,6 @@ class NubertConfigFlow(ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(CONF_ADDRESS): str,
                     vol.Optional(CONF_NAME): str,
-                    vol.Optional(ATTR_SUGGESTED_AREA): selector.AreaSelector(),
                 }
             )
 
@@ -124,4 +115,4 @@ class NubertConfigFlow(ConfigFlow, domain=DOMAIN):
 
 def _matches_nubert(info: BluetoothServiceInfo) -> bool:
     """Return True if the advertisement matches a Nubert speaker."""
-    return ADV_UUID.lower() in {u.lower() for u in info.service_uuids or []}
+    return any(u.lower() in ADV_UUIDS for u in (info.service_uuids or []))

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
+from contextlib import suppress
+import time
 
 from bleak import BleakClient
 from bleak.exc import BleakError
@@ -23,7 +25,13 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.components.bluetooth import async_ble_device_from_address
 
-from .const import DOMAIN, CHAR_UUID, SOURCE_NAMES
+from .const import (
+    DOMAIN,
+    CHAR_UUID_SPEAKER,
+    CHAR_UUID_SUB,
+    SOURCE_NAMES_SPEAKER,
+    SOURCE_NAMES_SUB,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -227,11 +235,18 @@ class NubertSpeakerCoordinator(DataUpdateCoordinator[None]):
         self._char = None  # characteristic object
         self._poll_event: asyncio.Event | None = None
         self._notif_supported: bool = True
+        # Device type detection – set to True once connected to a X-Sub
+        self._is_sub: bool = False
 
     # --------------------------- connection helpers ---------------------------
 
     async def _ensure_connected(self) -> None:
-        """Connect and subscribe to notifications if not already connected."""
+        """Connect and subscribe to notifications if not already connected.
+
+        Includes internal retry logic to avoid Home Assistant startup errors
+        when the first connection attempt happens to fail (busy adapter, device
+        not yet in range, …)."""
+
         if self._client and self._client.is_connected:
             return
 
@@ -239,37 +254,51 @@ class NubertSpeakerCoordinator(DataUpdateCoordinator[None]):
             async_ble_device_from_address(self.hass, self.address) or self.address
         )
 
-        client = BleakClient(device_or_addr, timeout=20.0)
-        try:
-            await client.connect()
-        except Exception as err:
-            raise BleakError(f"Connect failed: {err}") from err
+        for attempt in range(1, 4):
+            client = BleakClient(device_or_addr, timeout=20.0)
+            try:
+                await client.connect()
 
-        services = await client.get_services()
-        char_obj = None
-        for service in services:
-            maybe = service.get_characteristic(CHAR_UUID)
-            if maybe is not None:
-                char_obj = maybe
-                break
+                # ----------------- service / characteristic discovery -----------------
+                services = await client.get_services()
+                char_obj = None
+                for service in services:
+                    maybe = service.get_characteristic(CHAR_UUID_SPEAKER)
+                    if maybe is None:
+                        maybe = service.get_characteristic(CHAR_UUID_SUB)
+                    if maybe is not None:
+                        char_obj = maybe
+                        break
 
-        if char_obj is None:
-            await client.disconnect()
-            raise BleakError("Characteristic not found")
+                if char_obj is None:
+                    raise BleakError("Characteristic not found")
 
-        # Store
-        self._client = client
-        self._char = char_obj
+                # Store connected client/char
+                self._client = client
+                self._char = char_obj
+                self._is_sub = char_obj.uuid.lower() == CHAR_UUID_SUB.lower()
 
-        # Subscribe to notifications if supported
-        try:
-            await client.start_notify(char_obj, self._notification_cb)
-        except BleakError as err:
-            _LOGGER.debug("Notifications not supported: %s", err)
-            self._notif_supported = False
+                # Subscribe to notifications if supported
+                await client.start_notify(char_obj, self._notification_cb)
 
-        # Fire BLE_CONNECT_INDICATION sequence once
-        await self._ble_connect_indication_sequence()
+                # Fire BLE_CONNECT_INDICATION sequence once (non-blocking)
+                asyncio.create_task(self._ble_connect_indication_sequence())
+
+                # Success — exit the retry loop
+                return
+
+            except Exception as err:
+                _LOGGER.debug(
+                    "Connect attempt %s failed for %s: %s", attempt, self.address, err
+                )
+                # Clean up client on failure
+                with suppress(Exception):
+                    await client.disconnect()
+                if attempt == 5:
+                    raise BleakError(
+                        f"Connect failed after {attempt} attempts: {err}"
+                    ) from err
+                await asyncio.sleep(2)
 
     async def _ble_connect_indication_sequence(self) -> None:
         """Toggle BLE_CONNECT_INDICATION on the speaker (LED blink)."""
@@ -277,7 +306,7 @@ class NubertSpeakerCoordinator(DataUpdateCoordinator[None]):
         async def _send(val: bool):
             packet = "4D" + "01" + ("01" if val else "00")
             await self._client.write_gatt_char(
-                self._char, bytes.fromhex(packet), response=True
+                self._char, bytes.fromhex(packet), response=not self._is_sub
             )  # type: ignore[arg-type]
 
         try:
@@ -290,10 +319,8 @@ class NubertSpeakerCoordinator(DataUpdateCoordinator[None]):
     async def async_disconnect(self) -> None:
         """Cleanly disconnect BLE client."""
         if self._client and self._client.is_connected:
-            try:
+            with suppress(Exception):
                 await self._client.disconnect()
-            except Exception:  # noqa: BLE connection issues
-                pass
 
     # --------------------------- notification callback ---------------------------
 
@@ -309,106 +336,124 @@ class NubertSpeakerCoordinator(DataUpdateCoordinator[None]):
         if cmd == int(SOFT_POWER_OFF_GET, 16):
             if (val := _parse_power(payload)) is not None:
                 self.power = val
+                self.async_set_updated_data(None)
         elif cmd == int(VOLUME_ADJUST_GET, 16):
-            if (val := _parse_volume(payload)) is not None:
-                self.volume_db = val
+            if payload:
+                raw = payload[0]
+                if self._is_sub:
+                    # Subwoofer: raw 0..21 -> -15..+6 dB
+                    raw = min(raw, 21)
+                    self.volume_db = raw - 15
+                else:
+                    raw = min(raw, 100)
+                    self.volume_db = raw - 100
+                self.async_set_updated_data(None)
         elif cmd == int(SOURCE_SELECT_GET, 16):
             if (val := _parse_source(payload)) is not None:
                 self.source_code = val
+                self.async_set_updated_data(None)
         elif cmd == int(MUTE_SETTING_GET, 16):
             if payload:
                 self.muted = bool(payload[0])
+                self.async_set_updated_data(None)
         elif cmd == int(IS_SLAVE, 16):
             if payload:
                 self.is_slave = bool(payload[0])
-
-        # Wake polling waiters
-        if self._poll_event and not self._poll_event.is_set():
-            self._poll_event.set()
+                self.async_set_updated_data(None)
 
     # --------------------------- public helpers ---------------------------
 
     async def async_set_power(self, turn_on: bool) -> None:
         await self._async_send_simple(SOFT_POWER_OFF_SET, 0 if turn_on else 1)
-        self.power = turn_on
-        self.async_set_updated_data(None)
 
     async def async_set_volume(self, db_value: int) -> None:
-        raw_val = max(0, min(200, db_value + 100))
+        if self._is_sub:
+            db_value = max(-15, min(6, db_value))
+            raw_val = db_value + 15  # map to 0..21
+        else:
+            db_value = max(-100, min(0, db_value))
+            raw_val = db_value + 100  # map to 0..100
+
         await self._async_send_simple(VOLUME_ADJUST_SET, raw_val)
-        self.volume_db = db_value
-        self.async_set_updated_data(None)
 
     async def async_set_mute(self, mute: bool) -> None:
         await self._async_send_simple(MUTE_SETTING_SET, 1 if mute else 0)
-        self.muted = mute
-        self.async_set_updated_data(None)
 
     async def async_select_source(self, src_code: int) -> None:
         await self._async_send_simple(SOURCE_SELECT_SET, src_code)
-        self.source_code = src_code
-        self.async_set_updated_data(None)
 
     # --------------------------- internal BLE helpers ---------------------------
 
     async def _async_send_simple(self, cmd_hex: str, value_byte: int) -> None:
         packet = cmd_hex + "01" + f"{value_byte:02X}"
         async with self._ble_lock:
-            await self._async_write(bytes.fromhex(packet))
-
-    async def _async_write(self, data: bytes) -> None:
-        for attempt in range(1, 4):
-            try:
-                await self._ensure_connected()
-                await self._client.write_gatt_char(self._char, data, response=True)  # type: ignore[arg-type]
-                return
-            except Exception as exc:
-                if attempt == 3:
-                    _LOGGER.error(
-                        "Write failed after %s attempts to %s: %s",
-                        attempt,
-                        self.address,
-                        exc,
-                    )
-                    raise
-                _LOGGER.debug("Write attempt %s failed: %s", attempt, exc)
-                # Ensure we reconnect next loop
-                await self.async_disconnect()
-                await asyncio.sleep(1)
+            await self._client.write_gatt_char(
+                self._char,
+                bytes.fromhex(packet),
+                response=not self._is_sub,
+            )
 
     # --------------------------- DataUpdateCoordinator ---------------------------
 
-    async def _async_update_data(self) -> None:  # noqa: D401 (not returning data)
-        """Fetch latest state from the speaker."""
-        event = asyncio.Event()
-        self._poll_event = event
+    async def _async_update_data(self) -> None:
+        """Fetch latest state from the speaker ensuring we obtain vol & source."""
 
-        try:
-            async with self._ble_lock:
-                await self._ensure_connected()
-                # Already subscribed to notifications
-                await self._client.write_gatt_char(
-                    self._char, COMMAND_BYTES, response=True
-                )  # type: ignore[arg-type]
+        deadline = time.monotonic() + 8  # overall max time for a poll cycle
 
-                if self._notif_supported:
-                    try:
-                        await asyncio.wait_for(event.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        _LOGGER.debug("Timeout waiting for reply from %s", self.address)
-                else:
-                    # If no notifications, give device time then attempt read (best-effort)
-                    await asyncio.sleep(2)
-        except BleakError as err:
-            # Transient bluetooth backend issues (e.g., no connection slot). Retry later.
-            _LOGGER.debug("Transient BLE error while polling %s: %s", self.address, err)
-            raise UpdateFailed(err) from err
-        except Exception as err:
-            _LOGGER.warning("Failed to poll %s: %s", self.address, err)
-            raise UpdateFailed(err) from err
+        for attempt in range(1, 3):  # at most two command cycles per update
+            event = asyncio.Event()
+            self._poll_event = event
 
-        finally:
-            self._poll_event = None
+            try:
+                async with self._ble_lock:
+                    await self._ensure_connected()
+                    if self._client is None or self._char is None:
+                        raise UpdateFailed("No active BLE client")
+                    await self._client.write_gatt_char(
+                        self._char, COMMAND_BYTES, response=not self._is_sub
+                    )  # type: ignore[arg-type]
+
+                    # Wait until at least power+volume+source received or timeout
+                    if self._notif_supported:
+                        await asyncio.wait_for(event.wait(), timeout=3)
+                    else:
+                        await asyncio.sleep(2)
+            except asyncio.TimeoutError:
+                _LOGGER.debug("Timeout waiting for notifications from %s", self.address)
+            except BleakError as err:
+                _LOGGER.debug(
+                    "Transient BLE error while polling %s: %s", self.address, err
+                )
+                raise UpdateFailed(err) from err
+            except Exception as err:
+                _LOGGER.warning("Failed to poll %s: %s", self.address, err)
+                raise UpdateFailed(err) from err
+            finally:
+                self._poll_event = None
+
+            # Break early if we already have a full snapshot
+            if self.volume_db is not None and self.source_code is not None:
+                return
+
+            # Give up if we ran out of time
+            if time.monotonic() > deadline:
+                _LOGGER.debug("Polling deadline exceeded for %s", self.address)
+                break
+
+        # If we reach this point without volume/source we still return; values remain None
+
+    # Expose device type
+
+    @property
+    def is_sub(self) -> bool:
+        """Return True if this coordinator represents a X-Sub device."""
+        return self._is_sub
+
+    # Convenience mapping for sources depending on device type
+
+    @property
+    def source_names(self) -> dict[int, str]:
+        return SOURCE_NAMES_SUB if self._is_sub else SOURCE_NAMES_SPEAKER
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +478,7 @@ class NubertMediaPlayer(CoordinatorEntity[NubertSpeakerCoordinator], MediaPlayer
         super().__init__(coordinator)
         self._attr_unique_id = coordinator.address
         self._attr_name = coordinator.name
-        self._attr_source_list = list(SOURCE_NAMES.values())
+        self._attr_source_list = list(coordinator.source_names.values())
         self._suggested_area = suggested_area
 
     # ---------------------------------------------------------------------
@@ -451,14 +496,18 @@ class NubertMediaPlayer(CoordinatorEntity[NubertSpeakerCoordinator], MediaPlayer
         if self.coordinator.volume_db is None:
             return None
         # Map -100..0 dB to 0.0..1.0
-        vol_raw = self.coordinator.volume_db + 100  # 0..100
-        return max(0.0, min(1.0, vol_raw / 100))
+        if self.coordinator.is_sub:
+            vol_raw = self.coordinator.volume_db + 15  # 0..21
+            return max(0.0, min(1.0, vol_raw / 21))
+        else:
+            vol_raw = self.coordinator.volume_db + 100  # 0..100
+            return max(0.0, min(1.0, vol_raw / 100))
 
     @property
     def source(self) -> str | None:
         if self.coordinator.source_code is None:
             return None
-        return SOURCE_NAMES.get(self.coordinator.source_code)
+        return self.coordinator.source_names.get(self.coordinator.source_code)
 
     @property
     def device_info(self) -> DeviceInfo:  # type: ignore[override]
@@ -487,13 +536,16 @@ class NubertMediaPlayer(CoordinatorEntity[NubertSpeakerCoordinator], MediaPlayer
         await self.coordinator.async_set_power(False)
 
     async def async_set_volume_level(self, volume: float) -> None:
-        db_value = int(round((volume * 100) - 100))  # -100..0
-        db_value = max(-100, min(0, db_value))
-        # convert to protocol raw (0..100)
+        if self.coordinator.is_sub:
+            db_value = int(round(volume * 21)) - 15  # -15..+6
+        else:
+            db_value = int(round((volume * 100) - 100))  # -100..0
+            db_value = max(-100, min(0, db_value))
+
         await self.coordinator.async_set_volume(db_value)
 
     async def async_select_source(self, source: str) -> None:
-        for code, name in SOURCE_NAMES.items():
+        for code, name in self.coordinator.source_names.items():
             if source.upper() == name.upper():
                 await self.coordinator.async_select_source(code)
                 break

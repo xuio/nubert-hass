@@ -1,5 +1,9 @@
 # Nubert NuPro
 
-Integration for Nubert NuPro Speakers. For now it only supports the NuPro line (a600 BLE Profile)
+Integration for Nubert NuPro Speakers.
+
+Following models are supported for now:
+* X-Sub
+* NuPro X series
 
 speakers should be automatically discovered via BLE
