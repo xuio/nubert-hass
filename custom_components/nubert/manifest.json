@@ -1,15 +1,18 @@
 {
   "domain": "nubert",
-  "name": "Nubert Speakers",
+  "name": "Nubert",
   "version": "0.0.1",
   "documentation": "https://github.com/homeassistant/nubert",
   "dependencies": ["bluetooth"],
-  "codeowners": ["@yourgithubhandle"],
+  "codeowners": ["@xuio"],
   "requirements": ["bleak>=0.22.0"],
   "config_flow": true,
   "bluetooth": [
     {
       "service_uuid": "0000a600-0000-1000-8000-00805f9b34fb"
+    },
+    {
+      "service_uuid": "ac934713-4019-4441-9387-d53ba93ae21a"
     }
   ],
   "iot_class": "local_polling",

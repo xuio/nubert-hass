@@ -278,8 +278,15 @@ class NubertSpeakerCoordinator(DataUpdateCoordinator[None]):
                 self._char = char_obj
                 self._is_sub = char_obj.uuid.lower() == CHAR_UUID_SUB.lower()
 
-                # Subscribe to notifications if supported
-                await client.start_notify(char_obj, self._notification_cb)
+                # Subscribe to notifications if supported (only if the char itself flags notify)
+                if "notify" in (char_obj.properties or []):
+                    try:
+                        await client.start_notify(char_obj, self._notification_cb)
+                    except BleakError as err:
+                        _LOGGER.debug("Notifications not supported: %s", err)
+                        self._notif_supported = False
+                else:
+                    self._notif_supported = False
 
                 # Fire BLE_CONNECT_INDICATION sequence once (non-blocking)
                 asyncio.create_task(self._ble_connect_indication_sequence())
