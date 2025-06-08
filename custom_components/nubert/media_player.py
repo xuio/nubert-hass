@@ -586,8 +586,8 @@ async def async_setup_entry(
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"coordinator": coordinator}
 
     # Skip creating entity if speaker is slave
-    if coordinator.is_slave is True:
-        _LOGGER.info("Skipping entity creation for slave speaker %s", address)
-        return
+    # if coordinator.is_slave is True:
+    #     _LOGGER.info("Skipping entity creation for slave speaker %s", address)
+    #     return
 
     async_add_entities([NubertMediaPlayer(coordinator, suggested_area)])
