@@ -260,7 +260,23 @@ class NubertSpeakerCoordinator(DataUpdateCoordinator[None]):
                 await client.connect()
 
                 # ----------------- service / characteristic discovery -----------------
-                services = await client.get_services()
+                # Bleak >=1.0 exposes a ``services`` property instead of the
+                # earlier async ``get_services`` coroutine.  Handle both so the
+                # integration works with any underlying version or HA wrapper.
+
+                services = None
+                if hasattr(client, "services") and client.services:
+                    services = client.services  # type: ignore[attr-defined]
+                else:
+                    # Older Bleak (<=0.22) or wrapper still provides coroutine.
+                    try:
+                        services = await client.get_services()  # type: ignore[attr-defined]
+                    except AttributeError:
+                        # If neither attribute nor coroutine exists give up.
+                        raise BleakError(
+                            "Bleak client does not expose services information"
+                        )
+
                 char_obj = None
                 for service in services:
                     maybe = service.get_characteristic(CHAR_UUID_SPEAKER)
@@ -597,4 +613,3 @@ async def async_setup_entry(
     #    return
 
     async_add_entities([NubertMediaPlayer(coordinator, suggested_area)])
-
