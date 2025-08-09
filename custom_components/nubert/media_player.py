@@ -371,7 +371,13 @@ class NubertSpeakerCoordinator(DataUpdateCoordinator[None]):
     # --------------------------- public helpers ---------------------------
 
     async def async_set_power(self, turn_on: bool) -> None:
+        # Avoid sending a toggle if the device is already in the desired state
+        if self.power is not None and self.power == turn_on:
+            return
+
         await self._async_send_simple(SOFT_POWER_OFF_SET, 0 if turn_on else 1)
+        self.power = turn_on
+        self.async_set_updated_data(None)
 
     async def async_set_volume(self, db_value: int) -> None:
         if self._is_sub:
@@ -587,7 +593,8 @@ async def async_setup_entry(
 
     # Skip creating entity if speaker is slave
     # if coordinator.is_slave is True:
-    #     _LOGGER.info("Skipping entity creation for slave speaker %s", address)
-    #     return
+    #    _LOGGER.info("Skipping entity creation for slave speaker %s", address)
+    #    return
 
     async_add_entities([NubertMediaPlayer(coordinator, suggested_area)])
+
