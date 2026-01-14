@@ -5,7 +5,7 @@
   "documentation": "https://github.com/homeassistant/nubert",
   "dependencies": ["bluetooth"],
   "codeowners": ["@xuio"],
-  "requirements": ["bleak>=1.0.0,<2.0"],
+  "requirements": ["bleak>=2.0.0"],
   "config_flow": true,
   "bluetooth": [
     {
