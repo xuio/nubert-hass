@@ -1,58 +1,87 @@
 from __future__ import annotations
 
-import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 
-from homeassistant.core import HomeAssistant
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+)
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.const import CONF_ADDRESS
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from . import protocol as p
 from .const import DOMAIN
-from .media_player import NubertSpeakerCoordinator
+from .coordinator import NubertSpeakerCoordinator
+from .entity import NubertEntity
 
-_LOGGER = logging.getLogger(__name__)
+
+@dataclass(frozen=True, kw_only=True)
+class NubertSensorDescription(SensorEntityDescription):
+    value_fn: Callable[[NubertSpeakerCoordinator], str | None]
 
 
-class NubertSlaveSensor(CoordinatorEntity[NubertSpeakerCoordinator], SensorEntity):
-    """Sensor representing whether the speaker is a slave."""
+def _role(c: NubertSpeakerCoordinator) -> str | None:
+    if c.is_slave is None:
+        return None
+    return "Slave" if c.is_slave else "Master"
 
-    _attr_device_class = SensorDeviceClass.ENUM
-    _attr_options = ["Master", "Slave"]
 
-    def __init__(self, coordinator: NubertSpeakerCoordinator) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{coordinator.address}_role"
-        self._attr_name = f"{coordinator.name} Role"
-        self._attr_icon = "mdi:speaker-multiple"
-
-    @property
-    def native_value(self) -> str | None:  # type: ignore[override]
-        if self.coordinator.is_slave is None:
-            return None
-        return "Slave" if self.coordinator.is_slave else "Master"
-
-    @property
-    def device_info(self):  # type: ignore[override]
-        return {
-            "identifiers": {(DOMAIN, self.coordinator.address)},
-            "name": self.coordinator.name,
-        }
+SENSORS: tuple[NubertSensorDescription, ...] = (
+    # Unique id "<address>_role" is kept from earlier releases.
+    NubertSensorDescription(
+        key="role",
+        name="Role",
+        icon="mdi:speaker-multiple",
+        device_class=SensorDeviceClass.ENUM,
+        options=["Master", "Slave"],
+        value_fn=_role,
+    ),
+    NubertSensorDescription(
+        key="model",
+        name="Model",
+        icon="mdi:speaker",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda c: p.MODEL_NAMES.get(c.model),
+    ),
+    *(
+        NubertSensorDescription(
+            key=f"{kind}_version",
+            name=f"{label} version",
+            icon="mdi:chip",
+            entity_category=EntityCategory.DIAGNOSTIC,
+            entity_registry_enabled_default=kind in ("mcu", "dsp"),
+            value_fn=lambda c, kind=kind: c.versions.get(kind),
+        )
+        for kind, label in (
+            ("mcu", "MCU"),
+            ("dsp", "DSP"),
+            ("bluetooth", "Bluetooth"),
+            ("wireless", "Wireless"),
+            ("hardware", "Hardware"),
+        )
+    ),
+)
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities
-):
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+) -> None:
     """Set up sensor platform for Nubert speakers."""
+    coordinator: NubertSpeakerCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    async_add_entities(NubertSensor(coordinator, desc) for desc in SENSORS)
 
-    stored = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-    if stored and "coordinator" in stored:
-        coordinator: NubertSpeakerCoordinator = stored["coordinator"]
-    else:
-        address = entry.data[CONF_ADDRESS]
-        name: str | None = entry.title
-        coordinator = NubertSpeakerCoordinator(hass, address, name)
-        await coordinator.async_config_entry_first_refresh()
-        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"coordinator": coordinator}
 
-    async_add_entities([NubertSlaveSensor(coordinator)])
+class NubertSensor(NubertEntity, SensorEntity):
+    entity_description: NubertSensorDescription
+
+    def __init__(self, coordinator: NubertSpeakerCoordinator, desc: NubertSensorDescription) -> None:
+        super().__init__(coordinator, desc.key)
+        self.entity_description = desc
+
+    @property
+    def native_value(self) -> str | None:
+        return self.entity_description.value_fn(self.coordinator)

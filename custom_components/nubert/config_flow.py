@@ -12,7 +12,7 @@ from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.helpers import selector
 import voluptuous as vol
 
-from .const import DOMAIN, ADV_UUIDS
+from .const import DOMAIN, ADV_UUIDS, ADV_UUIDS_EXTRA
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ class NubertConfigFlow(ConfigFlow, domain=DOMAIN):
         devices = {
             info.address: info.name or info.address
             for info in bluetooth.async_discovered_service_info(self.hass)
-            if _matches_nubert(info)
+            if _matches_nubert(info) or _maybe_nubert(info)
         }
 
         if devices:
@@ -94,6 +94,7 @@ class NubertConfigFlow(ConfigFlow, domain=DOMAIN):
                         for addr, name in devices.items()
                     ],
                     mode=selector.SelectSelectorMode.DROPDOWN,
+                    custom_value=True,
                 )
             )
             schema = vol.Schema(
@@ -116,3 +117,8 @@ class NubertConfigFlow(ConfigFlow, domain=DOMAIN):
 def _matches_nubert(info: BluetoothServiceInfo) -> bool:
     """Return True if the advertisement matches a Nubert speaker."""
     return any(u.lower() in ADV_UUIDS for u in (info.service_uuids or []))
+
+
+def _maybe_nubert(info: BluetoothServiceInfo) -> bool:
+    """Return True for nuXero / nuConnect ampXL style advertisements."""
+    return any(u.lower() in ADV_UUIDS_EXTRA for u in (info.service_uuids or []))

@@ -1,11 +1,18 @@
 {
   "domain": "nubert",
   "name": "Nubert",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "documentation": "https://github.com/homeassistant/nubert",
-  "dependencies": ["bluetooth"],
-  "codeowners": ["@xuio"],
-  "requirements": ["bleak>=2.0.0"],
+  "dependencies": [
+    "bluetooth"
+  ],
+  "codeowners": [
+    "@xuio"
+  ],
+  "requirements": [
+    "bleak>=2.0.0",
+    "bleak-retry-connector>=3.5.0"
+  ],
   "config_flow": true,
   "bluetooth": [
     {
